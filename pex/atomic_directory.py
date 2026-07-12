@@ -73,9 +73,18 @@ class AtomicDirectory(object):
         self._lockfile = os.path.join(
             head, ".{target_dir_name}.atomic_directory.lck".format(target_dir_name=tail)
         )
-        self._work_dir = "{target_dir}.{type}.work".format(
-            target_dir=target_dir, type="lck" if locked else uuid4().hex
-        )
+        # Even locked atomic directories need an owner-specific work directory. The lock is the
+        # primary exclusion mechanism, but a process can be cancelled between acquiring the lock
+        # and cleaning up its work. Reusing a deterministic `<target>.lck.work` path allows a
+        # subsequent owner to adopt that path; late cleanup from the cancelled owner can then
+        # remove files underneath the new owner.
+        #
+        # A unique work directory preserves the lock's normal single-writer behavior while making
+        # cleanup ownership unambiguous when cancellation or a broken filesystem lock violates the
+        # expected lifecycle.
+        self._work_dir = (
+            "{target_dir}.lck.{uuid}.work" if locked else "{target_dir}.{uuid}.work"
+        ).format(target_dir=target_dir, uuid=uuid4().hex)
         self._target_dir = target_dir
 
         target_basename = os.path.basename(self._work_dir)

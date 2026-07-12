@@ -136,10 +136,27 @@ def test_atomic_directory_locked_mode():
     # type: () -> None
 
     assert AtomicDirectory("unlocked").work_dir != AtomicDirectory("unlocked").work_dir
-    assert (
-        AtomicDirectory("locked", locked=True).work_dir
-        == AtomicDirectory("locked", locked=True).work_dir
-    )
+    assert AtomicDirectory("locked", locked=True).work_dir != AtomicDirectory(
+        "locked", locked=True
+    ).work_dir
+
+
+def test_atomic_directory_locked_cleanup_is_owner_specific():
+    # type: () -> None
+    with temporary_dir() as sandbox:
+        target_dir = os.path.join(sandbox, "target_dir")
+        first = AtomicDirectory(target_dir, locked=True)
+        second = AtomicDirectory(target_dir, locked=True)
+
+        os.mkdir(first.work_dir)
+        os.mkdir(second.work_dir)
+        second_file = os.path.join(second.work_dir, "download.whl")
+        touch(second_file)
+
+        first.cleanup()
+
+        assert not os.path.exists(first.work_dir)
+        assert os.path.isfile(second_file)
 
 
 def test_long_file_name_issue_2087():
