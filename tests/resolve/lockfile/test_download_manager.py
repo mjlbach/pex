@@ -3,16 +3,21 @@
 
 import json
 import os.path
+from contextlib import contextmanager
 from io import BytesIO
 
 import pytest
 
 from pex import hashing
 from pex.artifact_url import ArtifactURL, Fingerprint
+from pex.atomic_directory import AtomicDirectory
 from pex.cache.dirs import CacheDir
+from pex.common import safe_rmtree
+from pex.fs.lock import FileLockStyle
 from pex.hashing import Sha1Fingerprint, Sha256Fingerprint
 from pex.pep_503 import ProjectName
-from pex.resolve.locked_resolve import FileArtifact
+from pex.resolve.locked_resolve import Artifact, FileArtifact, LocalProjectArtifact
+from pex.resolve.lockfile import download_manager as download_manager_module
 from pex.resolve.lockfile.download_manager import DownloadedArtifact, DownloadManager
 from pex.result import Error, catch
 from pex.typing import TYPE_CHECKING
@@ -28,7 +33,7 @@ else:
     from pex.third_party import attr
 
 
-class FakeDownloadManager(DownloadManager[FileArtifact]):
+class FakeDownloadManager(DownloadManager[Artifact]):
     def __init__(
         self,
         content,  # type: bytes
@@ -46,7 +51,7 @@ class FakeDownloadManager(DownloadManager[FileArtifact]):
 
     def save(
         self,
-        artifact,  # type: FileArtifact
+        artifact,  # type: Artifact
         project_name,  # type: ProjectName
         dest_dir,  # type: str
         digest,  # type: HintedDigest
@@ -54,7 +59,7 @@ class FakeDownloadManager(DownloadManager[FileArtifact]):
         # type: (...) -> Union[str, Error]
         self.save_calls.append(dest_dir)
         digest.update(self._content)
-        return artifact.filename
+        return artifact.filename if isinstance(artifact, FileArtifact) else "foo"
 
 
 @pytest.fixture
@@ -108,6 +113,66 @@ def test_storage_cache(
     assert 1 == len(download_manager.save_calls)
 
 
+def test_download_cache_uses_bsd_locks(download_manager):
+    # type: (FakeDownloadManager) -> None
+
+    assert FileLockStyle.BSD is download_manager._file_lock_style
+
+
+def test_storage_version_2_is_compatible(
+    artifact,  # type: FileArtifact
+    project_name,  # type: ProjectName
+    download_manager,  # type: FakeDownloadManager
+):
+    # type: (...) -> None
+
+    downloaded_artifact = download_manager.store(artifact, project_name)
+    metadata_file = DownloadedArtifact.metadata_filename(os.path.dirname(downloaded_artifact.path))
+    with open(metadata_file) as fp:
+        metadata = json.load(fp)
+    metadata.pop("editable")
+    metadata["version"] = DownloadedArtifact._LEGACY_METADATA_VERSION
+    with open(metadata_file, "w") as fp:
+        json.dump(metadata, fp)
+
+    assert downloaded_artifact == download_manager.store(artifact, project_name)
+    assert 1 == len(
+        download_manager.save_calls
+    ), "Version 2 metadata should be read in place instead of forcing a cache rebuild."
+
+
+def test_storage_version_2_is_rebuilt_for_an_editable_local_project(
+    artifact,  # type: FileArtifact
+    project_name,  # type: ProjectName
+    download_manager,  # type: FakeDownloadManager
+):
+    # type: (...) -> None
+
+    local_project = LocalProjectArtifact(
+        url=ArtifactURL.parse("file:///foo"),
+        fingerprint=artifact.fingerprint,
+        verified=True,
+        directory="/foo",
+        editable=False,
+    )
+    downloaded_artifact = download_manager.store(local_project, project_name)
+    metadata_file = DownloadedArtifact.metadata_filename(os.path.dirname(downloaded_artifact.path))
+    with open(metadata_file) as fp:
+        metadata = json.load(fp)
+    metadata.pop("editable")
+    metadata["version"] = DownloadedArtifact._LEGACY_METADATA_VERSION
+    with open(metadata_file, "w") as fp:
+        json.dump(metadata, fp)
+
+    editable_artifact = download_manager.store(
+        attr.evolve(local_project, editable=True), project_name
+    )
+    assert editable_artifact.editable
+    assert 2 == len(
+        download_manager.save_calls
+    ), "Version 2 metadata must be rebuilt when the requested local project is editable."
+
+
 def test_storage_version_upgrade(
     artifact,  # type: FileArtifact
     project_name,  # type: ProjectName
@@ -137,6 +202,76 @@ def test_storage_version_upgrade(
         "Expected each save call is with the same atomic directory work dir signalling a re-build "
         "of the same artifact storage."
     )
+
+
+def test_storage_version_upgrade_holds_artifact_lock(
+    artifact,  # type: FileArtifact
+    project_name,  # type: ProjectName
+    download_manager,  # type: FakeDownloadManager
+    monkeypatch,  # type: Any
+):
+    # type: (...) -> None
+
+    downloaded_artifact = download_manager.store(artifact, project_name)
+    os.unlink(DownloadedArtifact.metadata_filename(os.path.dirname(downloaded_artifact.path)))
+
+    lock_held = [False]
+    original_locked = AtomicDirectory.locked
+
+    @contextmanager
+    def track_locked(atomic_dir, lock_style=None):
+        # type: (AtomicDirectory, Any) -> Any
+        with original_locked(atomic_dir, lock_style=lock_style):
+            lock_held[0] = True
+            try:
+                yield
+            finally:
+                lock_held[0] = False
+
+    removed = []
+
+    def assert_locked_rmtree(path):
+        # type: (str) -> None
+        assert lock_held[0], "An invalid shared download must only be removed under its lock."
+        removed.append(path)
+        safe_rmtree(path)
+
+    monkeypatch.setattr(AtomicDirectory, "locked", track_locked)
+    monkeypatch.setattr(download_manager_module, "safe_rmtree", assert_locked_rmtree)
+
+    assert downloaded_artifact == download_manager.store(artifact, project_name)
+    assert [os.path.dirname(downloaded_artifact.path)] == removed
+
+
+def test_storage_version_upgrade_rechecks_after_locking(
+    artifact,  # type: FileArtifact
+    project_name,  # type: ProjectName
+    download_manager,  # type: FakeDownloadManager
+    monkeypatch,  # type: Any
+):
+    # type: (...) -> None
+
+    downloaded_artifact = download_manager.store(artifact, project_name)
+    original_load = DownloadedArtifact.load
+    load_calls = [0]
+
+    def load_after_concurrent_repair(artifact_dir):
+        # type: (str) -> DownloadedArtifact
+        load_calls[0] += 1
+        if load_calls[0] == 1:
+            raise DownloadedArtifact.LoadError("simulated concurrent repair")
+        return original_load(artifact_dir)
+
+    def fail_if_removed(_path):
+        # type: (str) -> None
+        pytest.fail("A cache repaired before the locked re-check must not be removed.")
+
+    monkeypatch.setattr(DownloadedArtifact, "load", load_after_concurrent_repair)
+    monkeypatch.setattr(download_manager_module, "safe_rmtree", fail_if_removed)
+
+    assert downloaded_artifact == download_manager.store(artifact, project_name)
+    assert 2 == load_calls[0]
+    assert 1 == len(download_manager.save_calls)
 
 
 def test_storage_version_downgrade_v0(tmpdir):

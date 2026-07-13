@@ -8,7 +8,7 @@ import json
 import os
 
 from pex import hashing
-from pex.atomic_directory import atomic_directory
+from pex.atomic_directory import AtomicDirectory, atomic_directory
 from pex.cache.dirs import DownloadDir
 from pex.common import safe_mkdtemp, safe_rmtree
 from pex.fs.lock import FileLockStyle
@@ -41,6 +41,7 @@ else:
 
 @attr.s(frozen=True)
 class DownloadedArtifact(object):
+    _LEGACY_METADATA_VERSION = 2
     _METADATA_VERSION = 3
 
     class LoadError(Exception):
@@ -95,22 +96,32 @@ class DownloadedArtifact(object):
                             path=metadata_filename, err=e
                         )
                     )
-                if not isinstance(metadata, dict) or cls._METADATA_VERSION != metadata.get(
-                    "version"
+                if not isinstance(metadata, dict) or metadata.get("version") not in (
+                    cls._LEGACY_METADATA_VERSION,
+                    cls._METADATA_VERSION,
                 ):
                     raise cls.LoadError(
                         "Unexpected downloaded artifact metadata object. Expected JSON metadata "
-                        "version {version} but found {metadata}".format(
-                            version=cls._METADATA_VERSION, metadata=metadata
+                        "version {legacy_version} or {version} but found {metadata}".format(
+                            legacy_version=cls._LEGACY_METADATA_VERSION,
+                            version=cls._METADATA_VERSION,
+                            metadata=metadata,
                         )
                     )
+                metadata_version = metadata["version"]
                 return DownloadedArtifact(
                     path=os.path.join(artifact_dir, metadata["filename"]),
                     fingerprint=hashing.new_fingerprint(
                         algorithm=str(metadata["algorithm"]), hexdigest=str(metadata["hexdigest"])
                     ),
                     subdirectory=metadata["subdirectory"],
-                    editable=metadata["editable"],
+                    # Metadata version 3 added support for editable local projects. All artifacts
+                    # stored with version 2 predate that support and are therefore non-editable.
+                    editable=(
+                        False
+                        if metadata_version == cls._LEGACY_METADATA_VERSION
+                        else metadata["editable"]
+                    ),
                 )
         except (OSError, IOError) as e:
             raise cls.LoadError(
@@ -129,7 +140,7 @@ class DownloadManager(Generic["_A"]):
     def __init__(
         self,
         pex_root=ENV,  # type: Union[str, Variables]
-        file_lock_style=FileLockStyle.POSIX,  # type: FileLockStyle.Value
+        file_lock_style=FileLockStyle.BSD,  # type: FileLockStyle.Value
     ):
         # type: (...) -> None
         self._pex_root = pex_root
@@ -167,16 +178,56 @@ class DownloadManager(Generic["_A"]):
             download_dir = safe_mkdtemp()
             self._download(artifact, project_name, download_dir)
 
+        expected_editable = (
+            artifact.editable
+            if isinstance(artifact, (LocalProjectArtifact, UnFingerprintedLocalProjectArtifact))
+            else False
+        )
+
+        def load_downloaded_artifact():
+            # type: () -> DownloadedArtifact
+            downloaded_artifact = DownloadedArtifact.load(download_dir)
+            if downloaded_artifact.editable != expected_editable:
+                raise DownloadedArtifact.LoadError(
+                    "Expected downloaded artifact metadata at {download_dir} to have "
+                    "editable={expected}, but found editable={actual}.".format(
+                        download_dir=download_dir,
+                        expected=expected_editable,
+                        actual=downloaded_artifact.editable,
+                    )
+                )
+            return downloaded_artifact
+
         try:
-            return DownloadedArtifact.load(download_dir)
+            return load_downloaded_artifact()
         except DownloadedArtifact.LoadError as e:
             if not retry:
                 raise ResultError(Error(str(e)))
 
-            TRACER.log(
-                "Found outdated downloaded artifact metadata, upgrading: {err}".format(err=e)
-            )
-            safe_rmtree(download_dir)
+            if hasattr(artifact, "fingerprint"):
+                # `atomic_directory` deliberately takes a lock only when its target does not
+                # exist. Re-check invalid metadata under the artifact lock: another process may
+                # have repaired it after our failed load but before we acquired the lock.
+                cached_download = AtomicDirectory(target_dir=download_dir, locked=True)
+                with cached_download.locked(lock_style=self._file_lock_style):
+                    try:
+                        return load_downloaded_artifact()
+                    except DownloadedArtifact.LoadError as locked_error:
+                        TRACER.log(
+                            "Found outdated downloaded artifact metadata, upgrading: "
+                            "{err}".format(err=locked_error)
+                        )
+                        safe_rmtree(download_dir)
+            else:
+                # Unfingerprinted artifacts use a private temporary directory, not the shared
+                # download cache, so there is no artifact lock to acquire for cleanup.
+                TRACER.log(
+                    "Found outdated downloaded artifact metadata, upgrading: {err}".format(err=e)
+                )
+                safe_rmtree(download_dir)
+
+            # Do not rebuild while holding the artifact lock: Pex's in-process file lock is
+            # intentionally non-reentrant. `atomic_directory` will re-check after acquiring it.
             return self.store(artifact, project_name, retry=False)
 
     def _download(
